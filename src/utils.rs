@@ -3,7 +3,7 @@ use std::sync::{Arc, LazyLock};
 use vulkano::{
     VulkanLibrary,
     buffer::{
-        BufferContents, BufferUsage, Subbuffer,
+        BufferContents, BufferUsage, BufferWriteGuard, Subbuffer,
         allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
     },
     command_buffer::{
@@ -15,7 +15,10 @@ use vulkano::{
         QueueFlags, physical::PhysicalDeviceType,
     },
     instance::{Instance, InstanceCreateFlags, InstanceCreateInfo},
-    memory::allocator::{MemoryTypeFilter, StandardMemoryAllocator},
+    memory::{
+        MemoryPropertyFlags,
+        allocator::{MemoryTypeFilter, StandardMemoryAllocator},
+    },
 };
 
 #[macro_export]
@@ -55,9 +58,9 @@ impl SubBuffersAllocator {
         );
     }
 
-    pub fn clear(&self) -> () {
-        self.gpu.set_arena_size(0);
-        self.cpu.set_arena_size(0);
+    pub fn clear_with_size(&self, size: u64) -> () {
+        self.gpu.set_arena_size(size);
+        self.cpu.set_arena_size(size);
     }
 }
 
@@ -153,7 +156,11 @@ pub fn get_device() -> (
             buffer_usage: BufferUsage::TRANSFER_DST
                 | BufferUsage::STORAGE_BUFFER
                 | BufferUsage::TRANSFER_SRC,
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            memory_type_filter: MemoryTypeFilter {
+                required_flags: MemoryPropertyFlags::DEVICE_LOCAL,
+                preferred_flags: MemoryPropertyFlags::empty(),
+                not_preferred_flags: MemoryPropertyFlags::empty(),
+            },
             ..Default::default()
         },
     ));
@@ -163,7 +170,7 @@ pub fn get_device() -> (
         SubbufferAllocatorCreateInfo {
             buffer_usage: BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
             memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                | MemoryTypeFilter::HOST_RANDOM_ACCESS,
             ..Default::default()
         },
     ));
@@ -200,7 +207,26 @@ impl<T: BufferContents + Copy> SubBufferPair<T> {
 }
 
 impl<T: BufferContents + Copy> SubBufferPair<T> {
+    pub fn get_cpu_buffer(&self) -> BufferWriteGuard<'_, [T]> {
+        self.cpu.write().unwrap()
+    }
+
     pub fn move_gpu<L>(
+        &self,
+        command_buffer: &mut AutoCommandBufferBuilder<L>,
+        size: usize,
+    ) -> Subbuffer<[T]> {
+        command_buffer
+            .copy_buffer(CopyBufferInfo::buffers(
+                self.cpu.clone().slice(0..size as u64),
+                self.gpu.clone().slice(0..size as u64),
+            ))
+            .unwrap();
+
+        self.gpu.clone().slice(0..size as u64)
+    }
+
+    pub fn move_gpu_data<L>(
         &self,
         data: &[T],
         command_buffer: &mut AutoCommandBufferBuilder<L>,
@@ -208,7 +234,10 @@ impl<T: BufferContents + Copy> SubBufferPair<T> {
         self.cpu.write().unwrap()[0..data.len()].copy_from_slice(&data);
 
         command_buffer
-            .copy_buffer(CopyBufferInfo::buffers(self.cpu.clone(), self.gpu.clone()))
+            .copy_buffer(CopyBufferInfo::buffers(
+                self.cpu.clone().slice(0..data.len() as u64),
+                self.gpu.clone().slice(0..data.len() as u64),
+            ))
             .unwrap();
 
         self.gpu.clone().slice(0..data.len() as u64)

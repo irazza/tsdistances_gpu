@@ -116,7 +116,7 @@ pub fn diamond_partitioning_gpu<G: GpuKernelImpl>(
         }
     }
 
-    subbuffer_allocator.clear();
+    subbuffer_allocator.clear_with_size(0);
 
     // panic!("dist matrix {:?}", &dist_matrix[..5].iter().map(|r| &r[..5]).collect::<Vec<_>>());
     dist_matrix
@@ -131,10 +131,18 @@ impl<G: GpuKernelImpl> DiamondPartitioning<G> {
         b_padded_len: u64,
         diag_len: u64,
     ) -> Self {
+        let a_buffer_size = a_count * a_padded_len;
+        let b_buffer_size = b_count * b_padded_len;
+        let diagonal_buffer_size = a_count * b_count * diag_len;
+
+        subbuffer_allocator.clear_with_size(
+            (a_buffer_size + b_buffer_size + diagonal_buffer_size) * size_of::<f32>() as u64,
+        );
+
         Self {
-            a_buffer: SubBufferPair::new(&subbuffer_allocator, a_count * a_padded_len),
-            b_buffer: SubBufferPair::new(&subbuffer_allocator, b_count * b_padded_len),
-            diagonal_buffer: SubBufferPair::new(&subbuffer_allocator, a_count * b_count * diag_len),
+            a_buffer: SubBufferPair::new(&subbuffer_allocator, a_buffer_size),
+            b_buffer: SubBufferPair::new(&subbuffer_allocator, b_buffer_size),
+            diagonal_buffer: SubBufferPair::new(&subbuffer_allocator, diagonal_buffer_size),
             kernel_params: None,
         }
     }
@@ -161,11 +169,15 @@ impl<G: GpuKernelImpl> DiamondPartitioning<G> {
     ) {
         let diag_len = 2 * (max(a_len, b_len) + 1).next_power_of_two();
 
-        let mut diagonal = vec![init_val; a_count * b_count * diag_len];
+        let mut diagonal_buffer_cpu = self.diagonal_buffer.get_cpu_buffer();
+        let diagonal_size = a_count * b_count * diag_len;
 
+        diagonal_buffer_cpu.fill(init_val);
         for i in 0..(a_count * b_count) {
-            diagonal[i * diag_len] = 0.0;
+            diagonal_buffer_cpu[i * diag_len] = 0.0;
         }
+
+        drop(diagonal_buffer_cpu);
 
         let n_tiles_in_a = a_len.div_ceil(max_subgroup_threads);
         let n_tiles_in_b = b_len.div_ceil(max_subgroup_threads);
@@ -191,9 +203,9 @@ impl<G: GpuKernelImpl> DiamondPartitioning<G> {
 
         let kernel_params = self.kernel_params.as_mut().unwrap();
 
-        let a_gpu = self.a_buffer.move_gpu(&a_padded, &mut builder);
-        let b_gpu = self.b_buffer.move_gpu(&b_padded, &mut builder);
-        let mut diagonal_buffer_gpu = self.diagonal_buffer.move_gpu(&diagonal, &mut builder);
+        let a_gpu = self.a_buffer.move_gpu_data(&a_padded, &mut builder);
+        let b_gpu = self.b_buffer.move_gpu_data(&b_padded, &mut builder);
+        let mut diagonal_buffer_gpu = self.diagonal_buffer.move_gpu(&mut builder, diagonal_size);
 
         // Number of kernel calls
         for i in 0..rows_count {

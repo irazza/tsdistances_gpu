@@ -72,7 +72,7 @@ macro_rules! warp_kernel_spec {
                                 let buffers = SubBufferPair::new(&_allocator, self.$vec5.len() as u64);
                             )?
                             KernelParams {
-                                $($vec5: buffers.move_gpu(&self.$vec5, _builder))?
+                                $($vec5: buffers.move_gpu_data(&self.$vec5, _builder))?
                             }
                         }
 
