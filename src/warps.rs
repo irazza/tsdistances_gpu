@@ -68,7 +68,8 @@ pub fn diamond_partitioning_gpu<G: GpuKernelImpl>(
     let b_padded = flatten_and_pad(&b, max_subgroup_size);
 
     let diag_len = 2 * (next_multiple_of_n(len, max_subgroup_size) + 1).next_power_of_two();
-    let max_pairs = max_storage_buffer_size / diag_len;
+
+    let max_pairs = (max_storage_buffer_size / diag_len).min(usize::MAX); // available_ram);
 
     let chunk_side = (max_pairs as f64).sqrt().floor() as usize;
     // to fill the gap in a or b chunk if one is too small
