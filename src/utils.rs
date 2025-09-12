@@ -43,20 +43,6 @@ pub struct SubBuffersAllocator {
 }
 
 impl SubBuffersAllocator {
-    pub fn debug(&self) {
-        use memory_stats::memory_stats;
-        if let Some(usage) = memory_stats() {
-            println!("Current physical memory usage: {}", usage.physical_mem);
-            println!("Current virtual memory usage: {}", usage.virtual_mem);
-        } else {
-            println!("Couldn't get the current memory usage :(");
-        }
-        println!(
-            "CPU arena size: {}, GPU arena size: {}",
-            self.cpu.arena_size(),
-            self.gpu.arena_size()
-        );
-    }
 
     pub fn clear_with_size(&self, size: u64) -> () {
         self.gpu.set_arena_size(size);
