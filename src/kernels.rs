@@ -1,4 +1,3 @@
-
 pub struct GpuMatrix<'a> {
     diagonal: &'a mut [f32],
     diagonal_offset: usize,
@@ -67,10 +66,13 @@ macro_rules! warp_kernel_spec {
                             &self,
                             _allocator: SubBuffersAllocator,
                             _builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-                            max_work_group_size: usize,
                         ) -> Self::KernelParams {
+                            $(
+                                use crate::utils::SubBufferPair;
+                                let buffers = SubBufferPair::new(&_allocator, self.$vec5.len() as u64);
+                            )?
                             KernelParams {
-                                $($vec5: crate::utils::move_gpu(&self.$vec5, &_allocator, _builder, max_work_group_size))?
+                                $($vec5: buffers.move_gpu_data(&self.$vec5, _builder))?
                             }
                         }
 
@@ -98,7 +100,7 @@ macro_rules! warp_kernel_spec {
                             let b_count = b.len() as u64 / b_len;
                             let threads_count = (a_count * b_count * tile_count * max_subgroup_threads) as u32;
                             let diag_len = diagonal.len() as u64 / (a_count * b_count);
-                            
+
 
                             let pipeline = crate::shader_load::get_shader_entry_pipeline(device.clone(), shader_name);
                             let layout = &pipeline.layout().set_layouts()[0];
@@ -374,13 +376,12 @@ macro_rules! warp_kernel_spec {
 
 #[cfg(not(target_arch = "spirv"))]
 pub mod kernel_trait {
+    use crate::utils::SubBuffersAllocator;
     use std::sync::Arc;
     use vulkano::buffer::Subbuffer;
     use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
     use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
     use vulkano::device::Device;
-    use crate::utils::SubBuffersAllocator;
-
 
     pub trait GpuKernelImpl {
         type KernelParams;
@@ -389,7 +390,6 @@ pub mod kernel_trait {
             &self,
             allocator: SubBuffersAllocator,
             builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-            max_work_group_size: usize,
         ) -> Self::KernelParams;
 
         fn dispatch(

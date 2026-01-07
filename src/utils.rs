@@ -3,12 +3,11 @@ use std::sync::{Arc, LazyLock};
 use vulkano::{
     VulkanLibrary,
     buffer::{
-        BufferContents, BufferUsage, Subbuffer,
+        BufferContents, BufferUsage, BufferWriteGuard, Subbuffer,
         allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
     },
     command_buffer::{
-        AutoCommandBufferBuilder, CommandBuffer, CopyBufferInfo,
-        allocator::StandardCommandBufferAllocator,
+        AutoCommandBufferBuilder, CopyBufferInfo, allocator::StandardCommandBufferAllocator,
     },
     descriptor_set::allocator::StandardDescriptorSetAllocator,
     device::{
@@ -16,10 +15,11 @@ use vulkano::{
         QueueFlags, physical::PhysicalDeviceType,
     },
     instance::{Instance, InstanceCreateFlags, InstanceCreateInfo},
-    memory::allocator::{MemoryTypeFilter, StandardMemoryAllocator},
+    memory::{
+        MemoryPropertyFlags,
+        allocator::{MemoryTypeFilter, StandardMemoryAllocator},
+    },
 };
-
-use crate::cpu;
 
 #[macro_export]
 macro_rules! assert_eq_with_tol {
@@ -40,6 +40,14 @@ macro_rules! assert_eq_with_tol {
 pub struct SubBuffersAllocator {
     gpu: Arc<SubbufferAllocator>,
     cpu: Arc<SubbufferAllocator>,
+}
+
+impl SubBuffersAllocator {
+
+    pub fn clear_with_size(&self, size: u64) -> () {
+        self.gpu.set_arena_size(size);
+        self.cpu.set_arena_size(size);
+    }
 }
 
 type CachedCore = (
@@ -134,7 +142,11 @@ pub fn get_device() -> (
             buffer_usage: BufferUsage::TRANSFER_DST
                 | BufferUsage::STORAGE_BUFFER
                 | BufferUsage::TRANSFER_SRC,
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            memory_type_filter: MemoryTypeFilter {
+                required_flags: MemoryPropertyFlags::DEVICE_LOCAL,
+                preferred_flags: MemoryPropertyFlags::empty(),
+                not_preferred_flags: MemoryPropertyFlags::empty(),
+            },
             ..Default::default()
         },
     ));
@@ -144,7 +156,7 @@ pub fn get_device() -> (
         SubbufferAllocatorCreateInfo {
             buffer_usage: BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
             memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                | MemoryTypeFilter::HOST_RANDOM_ACCESS,
             ..Default::default()
         },
     ));
@@ -161,49 +173,66 @@ pub fn get_device() -> (
     )
 }
 
-pub fn move_gpu<T: BufferContents + Copy, L>(
-    data: &[T],
-    subbuffer_allocator: &SubBuffersAllocator,
-    command_buffer: &mut AutoCommandBufferBuilder<L>,
-    alignment: usize,
-) -> Subbuffer<[T]> {
-    let padded_len = data.len().div_ceil(alignment) * alignment;
-
-    let cpu_buffer = subbuffer_allocator
-        .cpu
-        .allocate_slice(padded_len as u64)
-        .unwrap();
-    cpu_buffer.write().unwrap()[0..data.len()].copy_from_slice(&data);
-
-    let gpu_buffer = subbuffer_allocator
-        .gpu
-        .allocate_slice(padded_len as u64)
-        .unwrap();
-
-    command_buffer
-        .copy_buffer(CopyBufferInfo::buffers(
-            cpu_buffer.clone(),
-            gpu_buffer.clone(),
-        ))
-        .unwrap();
-
-    gpu_buffer
+pub struct SubBufferPair<T> {
+    cpu: Subbuffer<[T]>,
+    gpu: Subbuffer<[T]>,
 }
 
-pub fn move_cpu<T: BufferContents + Copy, L>(
-    subbuffer_allocator: &SubBuffersAllocator,
-    gpu_buffer: &Subbuffer<[T]>,
-    command_buffer: &mut AutoCommandBufferBuilder<L>,
-) -> Subbuffer<[T]> {
-    let cpu_buffer = subbuffer_allocator
-        .cpu
-        .allocate_slice(gpu_buffer.len() as u64)
-        .unwrap();
-    command_buffer
-        .copy_buffer(CopyBufferInfo::buffers(
-            gpu_buffer.clone(),
-            cpu_buffer.clone(),
-        ))
-        .unwrap();
-    cpu_buffer
+impl<T: BufferContents + Copy> SubBufferPair<T> {
+    pub fn new(subbuffer_allocator: &SubBuffersAllocator, length: u64) -> Self {
+        let cpu = subbuffer_allocator
+            .cpu
+            .allocate_slice(length)
+            .expect("failed to allocate cpu buffer");
+        let gpu = subbuffer_allocator
+            .gpu
+            .allocate_slice(length)
+            .expect("failed to allocate gpu buffer");
+        Self { cpu, gpu }
+    }
+}
+
+impl<T: BufferContents + Copy> SubBufferPair<T> {
+    pub fn get_cpu_buffer(&self) -> BufferWriteGuard<'_, [T]> {
+        self.cpu.write().unwrap()
+    }
+
+    pub fn move_gpu<L>(
+        &self,
+        command_buffer: &mut AutoCommandBufferBuilder<L>,
+        size: usize,
+    ) -> Subbuffer<[T]> {
+        command_buffer
+            .copy_buffer(CopyBufferInfo::buffers(
+                self.cpu.clone().slice(0..size as u64),
+                self.gpu.clone().slice(0..size as u64),
+            ))
+            .unwrap();
+
+        self.gpu.clone().slice(0..size as u64)
+    }
+
+    pub fn move_gpu_data<L>(
+        &self,
+        data: &[T],
+        command_buffer: &mut AutoCommandBufferBuilder<L>,
+    ) -> Subbuffer<[T]> {
+        self.cpu.write().unwrap()[0..data.len()].copy_from_slice(&data);
+
+        command_buffer
+            .copy_buffer(CopyBufferInfo::buffers(
+                self.cpu.clone().slice(0..data.len() as u64),
+                self.gpu.clone().slice(0..data.len() as u64),
+            ))
+            .unwrap();
+
+        self.gpu.clone().slice(0..data.len() as u64)
+    }
+
+    pub fn move_cpu<L>(&self, command_buffer: &mut AutoCommandBufferBuilder<L>) -> Subbuffer<[T]> {
+        command_buffer
+            .copy_buffer(CopyBufferInfo::buffers(self.gpu.clone(), self.cpu.clone()))
+            .unwrap();
+        self.cpu.clone()
+    }
 }

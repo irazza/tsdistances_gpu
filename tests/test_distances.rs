@@ -21,6 +21,7 @@ where
         let record = result?;
         let row: Vec<T> = record
             .iter()
+            .skip(1) // Skip the label column
             .map(|s| s.parse::<T>())
             .collect::<Result<Vec<_>, _>>()?;
         records.push(row);
@@ -71,7 +72,7 @@ fn test_erp_distance() {
     );
     let elapsed_time = start_time.elapsed();
     println!("ERP elapsed time: {:?}", elapsed_time);
-    write_csv("erp_result.csv", &result).unwrap();
+    // write_csv("erp_result.csv", &result).unwrap();
 
 }
 
@@ -95,13 +96,13 @@ fn test_lcss_distance() {
     );
     let elapsed = start.elapsed();
     println!("LCSS elapsed time: {:?}", elapsed);
-    write_csv("lcss_result.csv", &result).unwrap();
+    // write_csv("lcss_result.csv", &result).unwrap();
 }
 
 #[test]
 fn test_dtw_distance() {
-    let train_data: Vec<Vec<f32>> = read_txt("tests/ACSF1/ACSF1_TRAIN.csv").unwrap();
-    let test_data: Vec<Vec<f32>> = read_txt("tests/ACSF1/ACSF1_TEST.csv").unwrap();
+    let train_data: Vec<Vec<f32>> = read_txt("../../DATA/ucr/Wafer/Wafer_TRAIN.tsv").unwrap();
+    let test_data: Vec<Vec<f32>> = read_txt("../../DATA/ucr/Wafer/Wafer_TEST.tsv").unwrap();
 
     let start_time = std::time::Instant::now();
     let (device, queue, sba, sda, ma) = get_device();
@@ -117,7 +118,7 @@ fn test_dtw_distance() {
     );
     let elapsed_time = start_time.elapsed();
     println!("DTW elapsed time: {:?}", elapsed_time);
-    write_csv("dtw_result.csv", &result).unwrap();
+    // write_csv("dtw_result.csv", &result).unwrap();
 }
 
 #[test]
@@ -143,7 +144,7 @@ fn test_wdtw_distance() {
     );
     let elapsed_time = start.elapsed();
     println!("WDTW elapsed time: {:?}", elapsed_time);
-    write_csv("wdtw_result.csv", &result).unwrap();
+    // write_csv("wdtw_result.csv", &result).unwrap();
 }
 
 #[test]
@@ -168,7 +169,7 @@ fn test_adtw_distance() {
     );
     let elapsed_time = start_time.elapsed();
     println!("ADTW elapsed time: {:?}", elapsed_time);
-    write_csv("adtw_result.csv", &result).unwrap();
+    // write_csv("adtw_result.csv", &result).unwrap();
 }
 
 #[test]
@@ -190,7 +191,7 @@ fn test_msm_distance() {
     );
     let elapsed_time = start_time.elapsed();
     println!("MSM elapsed time: {:?}", elapsed_time);
-    write_csv("msm_result.csv", &result).unwrap();
+    // write_csv("msm_result.csv", &result).unwrap();
 }
 
 #[test]
@@ -217,5 +218,5 @@ fn test_twe_distance() {
     );
     let elapsed_time = start_time.elapsed();
     println!("TWE elapsed time: {:?}", elapsed_time);
-    write_csv("twe_result.csv", &result).unwrap();
+    // write_csv("twe_result.csv", &result).unwrap();
 }
