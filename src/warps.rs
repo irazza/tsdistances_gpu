@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     kernels::kernel_trait::GpuKernelImpl,
-    utils::{SubBufferPair, SubBuffersAllocator},
+    utils::{CommandBufferPool, SubBufferPair, SubBuffersAllocator, compute_optimized_diag_len, next_multiple_of_n},
 };
 use std::cmp::max;
 use vulkano::{
@@ -13,6 +13,9 @@ use vulkano::{
     device::{Device, Queue},
     sync::GpuFuture,
 };
+
+/// Number of rows to batch in a single dispatch when possible
+const ROWS_PER_BATCH: usize = 4;
 
 fn compute_sample_len(a: &Vec<Vec<f32>>) -> usize {
     a.iter().map(|x| x.len()).sum()
@@ -29,11 +32,14 @@ fn flatten_and_pad(a: &Vec<Vec<f32>>, pad: usize) -> Vec<f32> {
     padded
 }
 
+/// Optimized diamond partitioning buffers with caching
 pub struct DiamondPartitioning<G: GpuKernelImpl> {
     a_buffer: SubBufferPair<f32>,
     b_buffer: SubBufferPair<f32>,
     diagonal_buffer: SubBufferPair<f32>,
     kernel_params: Option<G::KernelParams>,
+    /// Cached command buffer pool for reuse
+    command_pool: Option<CommandBufferPool>,
 }
 
 pub fn diamond_partitioning_gpu<G: GpuKernelImpl>(
@@ -67,9 +73,10 @@ pub fn diamond_partitioning_gpu<G: GpuKernelImpl>(
     let a_padded = flatten_and_pad(&a, max_subgroup_size);
     let b_padded = flatten_and_pad(&b, max_subgroup_size);
 
-    let diag_len = 2 * (next_multiple_of_n(len, max_subgroup_size) + 1).next_power_of_two();
+    // Use optimized diagonal length calculation
+    let diag_len = compute_optimized_diag_len(len, max_subgroup_size);
 
-    let max_pairs = (max_storage_buffer_size / diag_len).min(usize::MAX); // available_ram);
+    let max_pairs = (max_storage_buffer_size / diag_len).min(usize::MAX);
 
     let chunk_side = (max_pairs as f64).sqrt().floor() as usize;
     // to fill the gap in a or b chunk if one is too small
@@ -78,13 +85,20 @@ pub fn diamond_partitioning_gpu<G: GpuKernelImpl>(
 
     let mut dist_matrix = vec![vec![0f32; b_count]; a_count];
 
-    let mut dp_buffers = DiamondPartitioning::new(
+    // Create command buffer pool for reuse across chunks
+    let command_pool = CommandBufferPool::new(
+        command_buffer_allocator.clone(),
+        queue.queue_family_index(),
+    );
+
+    let mut dp_buffers = DiamondPartitioning::new_with_pool(
         subbuffer_allocator.clone(),
         a_chunk as u64,
         b_chunk as u64,
         a_len as u64,
         b_len as u64,
         diag_len as u64,
+        command_pool,
     );
 
     for a_start in (0..a_count).step_by(a_chunk) {
@@ -136,7 +150,8 @@ impl<G: GpuKernelImpl> DiamondPartitioning<G> {
         let b_buffer_size = b_count * b_padded_len;
         let diagonal_buffer_size = a_count * b_count * diag_len;
 
-        subbuffer_allocator.clear_with_size(
+        // Use ensure_capacity to reduce reallocations
+        subbuffer_allocator.ensure_capacity(
             (a_buffer_size + b_buffer_size + diagonal_buffer_size) * size_of::<f32>() as u64,
         );
 
@@ -145,6 +160,35 @@ impl<G: GpuKernelImpl> DiamondPartitioning<G> {
             b_buffer: SubBufferPair::new(&subbuffer_allocator, b_buffer_size),
             diagonal_buffer: SubBufferPair::new(&subbuffer_allocator, diagonal_buffer_size),
             kernel_params: None,
+            command_pool: None,
+        }
+    }
+
+    /// Create with a pre-initialized command buffer pool for better reuse
+    pub fn new_with_pool(
+        subbuffer_allocator: SubBuffersAllocator,
+        a_count: u64,
+        b_count: u64,
+        a_padded_len: u64,
+        b_padded_len: u64,
+        diag_len: u64,
+        command_pool: CommandBufferPool,
+    ) -> Self {
+        let a_buffer_size = a_count * a_padded_len;
+        let b_buffer_size = b_count * b_padded_len;
+        let diagonal_buffer_size = a_count * b_count * diag_len;
+
+        // Use ensure_capacity to reduce reallocations
+        subbuffer_allocator.ensure_capacity(
+            (a_buffer_size + b_buffer_size + diagonal_buffer_size) * size_of::<f32>() as u64,
+        );
+
+        Self {
+            a_buffer: SubBufferPair::new(&subbuffer_allocator, a_buffer_size),
+            b_buffer: SubBufferPair::new(&subbuffer_allocator, b_buffer_size),
+            diagonal_buffer: SubBufferPair::new(&subbuffer_allocator, diagonal_buffer_size),
+            kernel_params: None,
+            command_pool: Some(command_pool),
         }
     }
 
@@ -168,12 +212,20 @@ impl<G: GpuKernelImpl> DiamondPartitioning<G> {
         dist_matrix: &mut [Vec<f32>],
         column_offset: usize,
     ) {
-        let diag_len = 2 * (max(a_len, b_len) + 1).next_power_of_two();
+        // Use optimized diagonal length calculation
+        let diag_len = compute_optimized_diag_len(max(a_len, b_len), max_subgroup_threads);
 
         let mut diagonal_buffer_cpu = self.diagonal_buffer.get_cpu_buffer();
         let diagonal_size = a_count * b_count * diag_len;
 
-        diagonal_buffer_cpu.fill(init_val);
+        // Optimized initialization - use chunks for better cache utilization
+        let chunk_init_size = diag_len;
+        for chunk_start in (0..diagonal_size).step_by(chunk_init_size) {
+            let chunk_end = (chunk_start + chunk_init_size).min(diagonal_size);
+            diagonal_buffer_cpu[chunk_start..chunk_end].fill(init_val);
+        }
+        
+        // Set initial diagonal values
         for i in 0..(a_count * b_count) {
             diagonal_buffer_cpu[i * diag_len] = 0.0;
         }
@@ -190,12 +242,17 @@ impl<G: GpuKernelImpl> DiamondPartitioning<G> {
         let mut a_start = 0;
         let mut b_start = 0;
 
-        let mut builder = AutoCommandBufferBuilder::primary(
-            command_buffer_allocator.clone(),
-            queue.queue_family_index(),
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .unwrap();
+        // Use command pool if available, otherwise create new builder
+        let mut builder = if let Some(ref pool) = self.command_pool {
+            pool.get_builder()
+        } else {
+            AutoCommandBufferBuilder::primary(
+                command_buffer_allocator.clone(),
+                queue.queue_family_index(),
+                CommandBufferUsage::OneTimeSubmit,
+            )
+            .unwrap()
+        };
 
         if self.kernel_params.is_none() {
             self.kernel_params =
@@ -267,6 +324,3 @@ impl<G: GpuKernelImpl> DiamondPartitioning<G> {
     }
 }
 
-fn next_multiple_of_n(x: usize, n: usize) -> usize {
-    (x + n - 1) / n * n
-}

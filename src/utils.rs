@@ -1,4 +1,5 @@
-use std::sync::{Arc, LazyLock};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use vulkano::{
     VulkanLibrary,
@@ -7,7 +8,8 @@ use vulkano::{
         allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
     },
     command_buffer::{
-        AutoCommandBufferBuilder, CopyBufferInfo, allocator::StandardCommandBufferAllocator,
+        AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo, PrimaryAutoCommandBuffer,
+        allocator::StandardCommandBufferAllocator,
     },
     descriptor_set::allocator::StandardDescriptorSetAllocator,
     device::{
@@ -20,6 +22,12 @@ use vulkano::{
         allocator::{MemoryTypeFilter, StandardMemoryAllocator},
     },
 };
+
+/// Threshold for direct upload via host-visible memory (in bytes)
+const DIRECT_UPLOAD_THRESHOLD: usize = 64 * 1024; // 64KB
+
+/// Cache line size for alignment
+const CACHE_LINE_SIZE: u64 = 64;
 
 #[macro_export]
 macro_rules! assert_eq_with_tol {
@@ -36,17 +44,138 @@ macro_rules! assert_eq_with_tol {
     };
 }
 
-#[derive(Clone)]
 pub struct SubBuffersAllocator {
     gpu: Arc<SubbufferAllocator>,
     cpu: Arc<SubbufferAllocator>,
+    /// Host-visible GPU memory for direct uploads (small data)
+    host_visible: Arc<SubbufferAllocator>,
+    current_size: Arc<std::sync::atomic::AtomicU64>,
+    /// Buffer pool for reusing allocations
+    buffer_pool: Arc<BufferPool>,
+}
+
+/// Buffer pool that caches allocations by size bucket
+pub struct BufferPool {
+    /// Cached buffers keyed by size bucket (rounded up to power of 2)
+    cached: Mutex<HashMap<u64, Vec<CachedBuffer>>>,
+    memory_allocator: Arc<StandardMemoryAllocator>,
+}
+
+struct CachedBuffer {
+    gpu: Subbuffer<[f32]>,
+    cpu: Subbuffer<[f32]>,
+}
+
+impl BufferPool {
+    pub fn new(memory_allocator: Arc<StandardMemoryAllocator>) -> Self {
+        Self {
+            cached: Mutex::new(HashMap::new()),
+            memory_allocator,
+        }
+    }
+
+    /// Get a size bucket for caching (round up to nearest power of 2)
+    fn size_bucket(size: u64) -> u64 {
+        if size == 0 {
+            return 0;
+        }
+        size.next_power_of_two()
+    }
+
+    /// Try to get a cached buffer of at least the requested size
+    pub fn try_get(&self, min_size: u64) -> Option<(Subbuffer<[f32]>, Subbuffer<[f32]>)> {
+        let bucket = Self::size_bucket(min_size);
+        let mut cache = self.cached.lock().unwrap();
+        if let Some(buffers) = cache.get_mut(&bucket) {
+            if let Some(cached) = buffers.pop() {
+                return Some((cached.gpu, cached.cpu));
+            }
+        }
+        None
+    }
+
+    /// Return a buffer to the pool for reuse
+    pub fn return_buffer(&self, gpu: Subbuffer<[f32]>, cpu: Subbuffer<[f32]>) {
+        let bucket = Self::size_bucket(gpu.len());
+        let mut cache = self.cached.lock().unwrap();
+        let buffers = cache.entry(bucket).or_insert_with(Vec::new);
+        // Limit cache size per bucket to prevent memory bloat
+        if buffers.len() < 8 {
+            buffers.push(CachedBuffer { gpu, cpu });
+        }
+    }
+
+    /// Clear all cached buffers
+    pub fn clear(&self) {
+        let mut cache = self.cached.lock().unwrap();
+        cache.clear();
+    }
+}
+
+impl Clone for SubBuffersAllocator {
+    fn clone(&self) -> Self {
+        Self {
+            gpu: self.gpu.clone(),
+            cpu: self.cpu.clone(),
+            host_visible: self.host_visible.clone(),
+            current_size: self.current_size.clone(),
+            buffer_pool: self.buffer_pool.clone(),
+        }
+    }
 }
 
 impl SubBuffersAllocator {
-
+    /// Clear and resize the arena. Only resizes if the new size is larger or significantly smaller.
+    /// This reduces allocation overhead for repeated calls with similar sizes.
     pub fn clear_with_size(&self, size: u64) -> () {
-        self.gpu.set_arena_size(size);
-        self.cpu.set_arena_size(size);
+        let current = self.current_size.load(std::sync::atomic::Ordering::Relaxed);
+        
+        // Only resize if:
+        // 1. New size is larger than current, OR
+        // 2. New size is less than 25% of current (to reclaim memory)
+        // 3. size is 0 (explicit cleanup)
+        if size > current || size == 0 || (current > 0 && size < current / 4) {
+            self.gpu.set_arena_size(size);
+            self.cpu.set_arena_size(size);
+            self.host_visible.set_arena_size(size.min(DIRECT_UPLOAD_THRESHOLD as u64 * 4));
+            self.current_size.store(size, std::sync::atomic::Ordering::Relaxed);
+        }
+        
+        // Clear buffer pool when size is 0
+        if size == 0 {
+            self.buffer_pool.clear();
+        }
+    }
+    
+    /// Ensure the allocator has at least the specified capacity.
+    /// Pre-allocate with extra headroom to reduce future resizes.
+    pub fn ensure_capacity(&self, required_size: u64) {
+        let current = self.current_size.load(std::sync::atomic::Ordering::Relaxed);
+        if required_size > current {
+            // Allocate 1.5x the required size to reduce future resizes
+            let new_size = required_size + required_size / 2;
+            self.gpu.set_arena_size(new_size);
+            self.cpu.set_arena_size(new_size);
+            self.host_visible.set_arena_size((new_size / 4).min(DIRECT_UPLOAD_THRESHOLD as u64 * 8));
+            self.current_size.store(new_size, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    
+    /// Get the buffer pool for caching allocations
+    pub fn buffer_pool(&self) -> &Arc<BufferPool> {
+        &self.buffer_pool
+    }
+    
+    /// Allocate host-visible GPU buffer for direct uploads
+    pub fn allocate_host_visible(&self, length: u64) -> Subbuffer<[f32]> {
+        self.host_visible
+            .allocate_slice(length)
+            .expect("failed to allocate host-visible buffer")
+    }
+    
+    /// Check if data size is suitable for direct upload
+    pub fn should_use_direct_upload(data_size: usize) -> bool {
+        data_size * std::mem::size_of::<f32>() <= DIRECT_UPLOAD_THRESHOLD
     }
 }
 
@@ -152,7 +281,7 @@ pub fn get_device() -> (
     ));
 
     let cpu_buffer_allocator = Arc::new(SubbufferAllocator::new(
-        memory_allocator,
+        memory_allocator.clone(),
         SubbufferAllocatorCreateInfo {
             buffer_usage: BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
             memory_type_filter: MemoryTypeFilter::PREFER_HOST
@@ -160,6 +289,24 @@ pub fn get_device() -> (
             ..Default::default()
         },
     ));
+
+    // Host-visible GPU memory for direct uploads (small data optimization)
+    let host_visible_allocator = Arc::new(SubbufferAllocator::new(
+        memory_allocator.clone(),
+        SubbufferAllocatorCreateInfo {
+            buffer_usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC,
+            memory_type_filter: MemoryTypeFilter {
+                // Prefer host-visible device-local for unified memory architectures
+                required_flags: MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT,
+                preferred_flags: MemoryPropertyFlags::DEVICE_LOCAL,
+                not_preferred_flags: MemoryPropertyFlags::empty(),
+            },
+            ..Default::default()
+        },
+    ));
+
+    // Create buffer pool for reusing allocations
+    let buffer_pool = Arc::new(BufferPool::new(memory_allocator.clone()));
 
     (
         device,
@@ -169,6 +316,9 @@ pub fn get_device() -> (
         SubBuffersAllocator {
             gpu: gpu_buffer_allocator,
             cpu: cpu_buffer_allocator,
+            host_visible: host_visible_allocator,
+            current_size: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            buffer_pool,
         },
     )
 }
@@ -235,4 +385,50 @@ impl<T: BufferContents + Copy> SubBufferPair<T> {
             .unwrap();
         self.cpu.clone()
     }
+}
+/// Command buffer pool for reusing command buffers across operations
+pub struct CommandBufferPool {
+    queue_family_index: u32,
+    allocator: Arc<StandardCommandBufferAllocator>,
+}
+
+impl CommandBufferPool {
+    pub fn new(allocator: Arc<StandardCommandBufferAllocator>, queue_family_index: u32) -> Self {
+        Self {
+            queue_family_index,
+            allocator,
+        }
+    }
+
+    /// Get a new primary command buffer builder
+    pub fn get_builder(&self) -> AutoCommandBufferBuilder<PrimaryAutoCommandBuffer> {
+        AutoCommandBufferBuilder::primary(
+            self.allocator.clone(),
+            self.queue_family_index,
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .expect("Failed to create command buffer builder")
+    }
+}
+
+/// Align a size to cache line boundary for better memory access patterns
+#[inline]
+pub fn align_to_cache_line(size: u64) -> u64 {
+    (size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1)
+}
+
+/// Compute optimized diagonal buffer length
+/// Uses cache-aligned size instead of power-of-two to reduce over-allocation
+#[inline]
+pub fn compute_optimized_diag_len(len: usize, max_subgroup_size: usize) -> usize {
+    let base_len = 2 * (next_multiple_of_n(len, max_subgroup_size) + 1);
+    // Align to power of 2 for efficient indexing, but use smaller multiplier
+    // Use next power of 2 for efficient mask-based indexing
+    base_len.next_power_of_two()
+}
+
+/// Compute next multiple of n (utility function)
+#[inline]
+pub fn next_multiple_of_n(x: usize, n: usize) -> usize {
+    (x + n - 1) / n * n
 }
